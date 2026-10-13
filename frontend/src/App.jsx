@@ -1,41 +1,42 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { FilesetResolver, HandLandmarker, DrawingUtils } from '@mediapipe/tasks-vision';
-import { Card, CardContent } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 
 export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-  const [prediction, setPrediction] = useState("Waiting for signs...");
-  const [currentWord, setCurrentWord] = useState("");
   const wsRef = useRef(null);
   const handLandmarkerRef = useRef(null);
   const lastAddedCharRef = useRef("");
+  const missingFramesCountRef = useRef(0);
 
-  // 1. Initialize WebSocket connection to FastAPI
+  const [prediction, setPrediction] = useState("-");
+  const [currentWord, setCurrentWord] = useState("");
+  const [wsStatus, setWsStatus] = useState("Disconnected");
+
+  // 1. Initialize WebSocket Connection
   useEffect(() => {
-    wsRef.current = new WebSocket("ws://localhost:8000/ws/predict");
+    const ws = new WebSocket("ws://localhost:8000/ws/predict");
+    wsRef.current = ws;
 
-    wsRef.current.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      const pred = data.prediction;
-      setPrediction(pred);
+    ws.onopen = () => setWsStatus("Connected");
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const pred = data.prediction;
+        setPrediction(pred || "-");
 
-      // Basic logic to append stable letters to the word box
-      if (pred && pred.length === 1 && pred !== lastAddedCharRef.current && pred !== "...") {
-        setCurrentWord((prev) => prev + pred);
-        lastAddedCharRef.current = pred;
+        if (pred && pred.length === 1 && pred !== lastAddedCharRef.current && pred !== "-" && pred !== "...") {
+          setCurrentWord((prev) => prev + pred);
+          lastAddedCharRef.current = pred;
+        }
+      } catch (err) {
+        console.error("WebSocket message parsing error:", err);
       }
     };
+    ws.onerror = () => setWsStatus("Error");
+    ws.onclose = () => setWsStatus("Disconnected");
 
-    wsRef.current.onerror = (err) => {
-      console.error("WebSocket error:", err);
-    };
-
-    return () => {
-      wsRef.current?.close();
-    };
+    return () => ws.close();
   }, []);
 
   // 2. Initialize MediaPipe HandLandmarker
@@ -66,7 +67,7 @@ export default function App() {
 
   // 3. Start Webcam Stream
   const startWebcam = () => {
-    navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
+    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } })
       .then((stream) => {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
@@ -79,15 +80,14 @@ export default function App() {
       .catch((err) => console.error("Webcam access error:", err));
   };
 
-  // Text-to-Speech Handler
   const speakWord = () => {
-    if ('speechSynthesis' in window && currentWord) {
+    if ('speechSynthesis' in window && currentWord.trim()) {
       const utterance = new SpeechSynthesisUtterance(currentWord);
       window.speechSynthesis.speak(utterance);
     }
   };
 
-  // Frame-by-frame loop with crash protection
+  // 4. Detection Loop
   let lastVideoTime = -1;
   const predictWebcam = async () => {
     try {
@@ -113,15 +113,18 @@ export default function App() {
               const drawingUtils = new DrawingUtils(canvasCtx);
 
               if (results.landmarks && results.landmarks.length > 0) {
+                // Hand is present, reset missing frame tracking
+                missingFramesCountRef.current = 0;
+
                 for (const landmarks of results.landmarks) {
                   drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, {
                     color: "#22c55e",
-                    lineWidth: 4
+                    lineWidth: 3
                   });
                   drawingUtils.drawLandmarks(landmarks, {
                     color: "#ef4444",
-                    lineWidth: 2,
-                    radius: 5
+                    lineWidth: 1.5,
+                    radius: 4
                   });
                 }
 
@@ -130,8 +133,12 @@ export default function App() {
                   wsRef.current.send(JSON.stringify({ landmarks }));
                 }
               } else {
-                // Reset tracker memory when hand leaves the screen
-                lastAddedCharRef.current = "";
+                // Hand is missing, count frames before resetting active letter state
+                missingFramesCountRef.current += 1;
+                if (missingFramesCountRef.current > 10) { // ~1/3rd of a second threshold
+                  lastAddedCharRef.current = "";
+                  setPrediction("-");
+                }
               }
               canvasCtx.restore();
             }
@@ -146,50 +153,352 @@ export default function App() {
   };
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-slate-950 text-white p-6">
-      <h1 className="text-3xl font-bold mb-6">Real-Time Sign Language Translator</h1>
-      
-      <Card className="w-full max-w-2xl bg-slate-900 border-slate-800 p-4 shadow-xl space-y-4">
-        <CardContent className="flex flex-col items-center space-y-4 p-0">
-          <div className="relative w-full aspect-[4/3] bg-black rounded-lg overflow-hidden flex items-center justify-center border border-slate-800">
+    <div style={styles.appContainer}>
+      {/* Header Bar */}
+      <header style={styles.header}>
+        <div style={styles.headerLeft}>
+          <div style={{
+            ...styles.dot,
+            backgroundColor: wsStatus === "Connected" ? "#10b981" : "#f43f5e"
+          }} />
+          <h1 style={styles.title}>ASL Real-Time Translator</h1>
+        </div>
+        <div style={styles.headerRight}>
+          <span style={styles.badge}>WS: {wsStatus}</span>
+          <span style={styles.badge}>MediaPipe + FastAPI</span>
+        </div>
+      </header>
+
+      {/* Main Single-Screen Grid */}
+      <main style={styles.mainGrid}>
+        
+        {/* Left Video Area */}
+        <div style={styles.videoCard}>
+          <div style={styles.cardHeader}>
+            <span style={styles.cardHeaderTitle}>Live Camera Feed</span>
+            <span style={styles.activeTag}>CAMERA ACTIVE</span>
+          </div>
+
+          <div style={styles.videoWrapper}>
             <video 
               ref={videoRef} 
               playsInline 
               muted 
-              className="absolute inset-0 w-full h-full -scale-x-100 object-contain" 
+              style={styles.video} 
             />
             <canvas 
               ref={canvasRef} 
-              className="absolute inset-0 w-full h-full -scale-x-100 pointer-events-none object-contain" 
+              style={styles.canvas} 
             />
+
+            <div style={styles.overlayBadge}>
+              <span style={styles.overlayText}>Detected:</span>
+              <span style={styles.overlayLetter}>{prediction}</span>
+            </div>
           </div>
+        </div>
+
+        {/* Right Sidebar Area */}
+        <div style={styles.sidebar}>
           
-          <div className="flex items-center space-x-2 w-full justify-between pt-2">
-            <span className="text-sm text-slate-400">Current Letter:</span>
-            <Badge variant="outline" className="text-lg px-4 py-1 text-green-400 border-green-500/50">
-              {prediction}
-            </Badge>
+          {/* Active Letter */}
+          <div style={styles.letterCard}>
+            <span style={styles.sectionTitle}>Active Sign Letter</span>
+            <div style={styles.letterDisplay}>{prediction}</div>
           </div>
 
-          {/* Word Accumulation & Speech Controls */}
-          <div className="flex flex-col w-full space-y-2 bg-slate-950 p-4 rounded-lg border border-slate-800">
-            <div className="flex justify-between items-center">
-              <span className="text-xs text-slate-400 uppercase tracking-wider font-semibold">Translated Transcript</span>
-              <div className="space-x-2">
-                <Button variant="outline" size="sm" onClick={() => setCurrentWord("")} className="border-slate-700 text-slate-300 hover:bg-slate-800">
-                  Clear
-                </Button>
-                <Button size="sm" onClick={speakWord} className="bg-green-600 hover:bg-green-700 text-white">
-                  Speak Word
-                </Button>
+          {/* Transcript & Controls */}
+          <div style={styles.transcriptCard}>
+            <div style={styles.transcriptSection}>
+              <div style={styles.transcriptHeader}>
+                <span style={styles.sectionTitle}>Translated Transcript</span>
+                <span style={styles.charCount}>{currentWord.length} chars</span>
+              </div>
+
+              <div style={styles.transcriptBox}>
+                {currentWord || <span style={styles.placeholder}>Spelled signs will accumulate here...</span>}
               </div>
             </div>
-            <div className="min-h-[40px] text-xl font-medium tracking-wide text-green-300 flex items-center">
-              {currentWord || <span className="text-slate-600 italic text-sm">Spelled words will appear here...</span>}
+
+            <div style={styles.buttonGroup}>
+              <button 
+                onClick={() => setCurrentWord((prev) => prev + " ")}
+                style={styles.btnSecondary}
+              >
+                Space
+              </button>
+              <button 
+                onClick={() => { setCurrentWord(""); lastAddedCharRef.current = ""; }} 
+                style={styles.btnSecondary}
+              >
+                Clear
+              </button>
+              <button 
+                onClick={speakWord} 
+                style={styles.btnPrimary}
+              >
+                🔊 Speak
+              </button>
             </div>
           </div>
-        </CardContent>
-      </Card>
+
+        </div>
+
+      </main>
     </div>
   );
 }
+
+const styles = {
+  appContainer: {
+    height: "100vh",
+    width: "100vw",
+    backgroundColor: "#020617",
+    color: "#f8fafc",
+    fontFamily: "system-ui, -apple-system, sans-serif",
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+    boxSizing: "border-box",
+  },
+  header: {
+    borderBottom: "1px solid #1e293b",
+    backgroundColor: "#0f172a",
+    padding: "8px 16px",
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    flexShrink: 0,
+  },
+  headerLeft: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+  },
+  dot: {
+    width: "8px",
+    height: "8px",
+    borderRadius: "50%",
+  },
+  title: {
+    fontSize: "14px",
+    fontWeight: "700",
+    margin: 0,
+  },
+  headerRight: {
+    display: "flex",
+    gap: "8px",
+  },
+  badge: {
+    fontSize: "10px",
+    fontFamily: "monospace",
+    backgroundColor: "#1e293b",
+    color: "#94a3b8",
+    padding: "2px 8px",
+    borderRadius: "4px",
+    border: "1px solid #334155",
+  },
+  mainGrid: {
+    flex: 1,
+    padding: "12px",
+    display: "grid",
+    gridTemplateColumns: "2fr 1fr",
+    gap: "12px",
+    minHeight: 0,
+    overflow: "hidden",
+    boxSizing: "border-box",
+  },
+  videoCard: {
+    backgroundColor: "#0f172a",
+    border: "1px solid #1e293b",
+    borderRadius: "8px",
+    padding: "8px",
+    display: "flex",
+    flexDirection: "column",
+    minHeight: 0,
+    overflow: "hidden",
+  },
+  cardHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingBottom: "6px",
+    borderBottom: "1px solid #1e293b",
+    marginBottom: "8px",
+    flexShrink: 0,
+  },
+  cardHeaderTitle: {
+    fontSize: "12px",
+    color: "#94a3b8",
+  },
+  activeTag: {
+    fontSize: "10px",
+    backgroundColor: "rgba(16, 185, 129, 0.1)",
+    color: "#34d399",
+    border: "1px solid rgba(16, 185, 129, 0.2)",
+    padding: "1px 6px",
+    borderRadius: "4px",
+    fontWeight: "600",
+  },
+  videoWrapper: {
+    position: "relative",
+    width: "100%",
+    height: "100%",
+    backgroundColor: "#000000",
+    borderRadius: "6px",
+    overflow: "hidden",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  video: {
+    position: "absolute",
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    objectFit: "cover",
+    transform: "scaleX(-1)",
+  },
+  canvas: {
+    position: "absolute",
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    objectFit: "cover",
+    transform: "scaleX(-1)",
+    pointerEvents: "none",
+  },
+  overlayBadge: {
+    position: "absolute",
+    top: "10px",
+    right: "10px",
+    backgroundColor: "rgba(2, 6, 23, 0.85)",
+    border: "1px solid #1e293b",
+    borderRadius: "6px",
+    padding: "4px 10px",
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+  },
+  overlayText: {
+    fontSize: "10px",
+    color: "#94a3b8",
+    fontWeight: "600",
+  },
+  overlayLetter: {
+    fontSize: "18px",
+    fontWeight: "900",
+    color: "#34d399",
+  },
+  sidebar: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "12px",
+    minHeight: 0,
+    overflow: "hidden",
+  },
+  letterCard: {
+    backgroundColor: "#0f172a",
+    border: "1px solid #1e293b",
+    borderRadius: "8px",
+    padding: "12px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+  },
+  sectionTitle: {
+    fontSize: "10px",
+    fontWeight: "600",
+    color: "#94a3b8",
+    textTransform: "uppercase",
+    marginBottom: "6px",
+  },
+  letterDisplay: {
+    height: "56px",
+    width: "56px",
+    borderRadius: "8px",
+    backgroundColor: "#020617",
+    border: "1px solid #1e293b",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: "28px",
+    fontWeight: "900",
+    color: "#34d399",
+  },
+  transcriptCard: {
+    flex: 1,
+    backgroundColor: "#0f172a",
+    border: "1px solid #1e293b",
+    borderRadius: "8px",
+    padding: "12px",
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "space-between",
+    minHeight: 0,
+    overflow: "hidden",
+  },
+  transcriptSection: {
+    display: "flex",
+    flexDirection: "column",
+    flex: 1,
+    minHeight: 0,
+  },
+  transcriptHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: "6px",
+    flexShrink: 0,
+  },
+  charCount: {
+    fontSize: "10px",
+    color: "#64748b",
+  },
+  transcriptBox: {
+    flex: 1,
+    padding: "10px",
+    backgroundColor: "#020617",
+    borderRadius: "6px",
+    border: "1px solid #1e293b",
+    fontSize: "14px",
+    color: "#f8fafc",
+    wordBreak: "break-word",
+    overflowY: "auto",
+    minHeight: 0,
+  },
+  placeholder: {
+    color: "#475569",
+    fontSize: "12px",
+    fontStyle: "italic",
+  },
+  buttonGroup: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr 1fr",
+    gap: "6px",
+    marginTop: "10px",
+    flexShrink: 0,
+  },
+  btnSecondary: {
+    backgroundColor: "#1e293b",
+    color: "#cbd5e1",
+    border: "1px solid #334155",
+    padding: "6px",
+    borderRadius: "6px",
+    fontSize: "11px",
+    fontWeight: "600",
+    cursor: "pointer",
+  },
+  btnPrimary: {
+    backgroundColor: "#059669",
+    color: "#ffffff",
+    border: "none",
+    padding: "6px",
+    borderRadius: "6px",
+    fontSize: "11px",
+    fontWeight: "600",
+    cursor: "pointer",
+  },
+};

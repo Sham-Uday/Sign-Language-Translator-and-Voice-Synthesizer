@@ -1,8 +1,13 @@
 import json
+import warnings
 import numpy as np
 import joblib
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from sklearn.exceptions import InconsistentVersionWarning
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
 app = FastAPI()
 
@@ -14,7 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load model
 try:
     model = joblib.load("model.pkl")
     print("Model loaded successfully!")
@@ -28,31 +32,46 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
-            payload = json.loads(data)
-            
-            landmarks = payload.get("landmarks", [])
-            
-            # Default to empty if no hand landmarks are present
-            result = ""
-            
-            if model and len(landmarks) >= 21:
-                features = []
-                for pt in landmarks[:21]:
-                    if isinstance(pt, dict):
-                        features.extend([pt.get("x", 0), pt.get("y", 0), pt.get("z", 0)])
-                    elif isinstance(pt, (list, tuple)) and len(pt) >= 3:
-                        features.extend([pt[0], pt[1], pt[2]])
+            try:
+                payload = json.loads(data)
+                landmarks = payload.get("landmarks", [])
                 
-                if len(features) == 63:
-                    X_input = np.array(features).reshape(1, -1)
-                    prediction = model.predict(X_input)[0]
-                    confidence = np.max(model.predict_proba(X_input))
+                result = "-"
+                
+                if model and len(landmarks) >= 21:
+                    pts = []
+                    for pt in landmarks[:21]:
+                        if isinstance(pt, dict):
+                            pts.append([pt.get("x", 0), pt.get("y", 0), pt.get("z", 0)])
+                        elif isinstance(pt, (list, tuple)) and len(pt) >= 3:
+                            pts.append([pt[0], pt[1], pt[2]])
                     
-                    # Only accept prediction if confidence is high enough
-                    if confidence > 0.6:
-                        result = str(prediction)
+                    if len(pts) == 21:
+                        pts = np.array(pts)
+                        wrist = pts[0]
+                        pts = pts - wrist
+                        max_dist = np.max(np.linalg.norm(pts, axis=1))
+                        if max_dist > 0:
+                            pts = pts / max_dist
+                        
+                        features = pts.flatten()
+                        
+                        if len(features) == 63:
+                            X_input = features.reshape(1, -1)
+                            prediction = model.predict(X_input)[0]
+                            confidence = np.max(model.predict_proba(X_input))
+                            
+                            # Stricter confidence filter to avoid background guesses
+                            if confidence > 0.55:
+                                result = str(prediction)
 
-            await websocket.send_json({"prediction": result})
-            
+                # Safely send, exit loop if connection closed
+                await websocket.send_json({"prediction": result})
+                
+            except json.JSONDecodeError:
+                continue
+            except Exception:
+                break 
+                
     except WebSocketDisconnect:
-        print("Frontend disconnected")
+        pass

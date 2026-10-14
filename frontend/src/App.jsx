@@ -4,39 +4,22 @@ import { FilesetResolver, HandLandmarker, DrawingUtils } from '@mediapipe/tasks-
 export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-  const wsRef = useRef(null);
   const handLandmarkerRef = useRef(null);
   const lastAddedCharRef = useRef("");
-  const missingFramesCountRef = useRef(0);
+  const isFetchingRef = useRef(false); // Prevents overlapping HTTP requests
 
   const [prediction, setPrediction] = useState("-");
   const [currentWord, setCurrentWord] = useState("");
-  const [wsStatus, setWsStatus] = useState("Disconnected");
+  const [serverStatus, setServerStatus] = useState("Checking...");
 
-  // 1. Initialize WebSocket Connection
+  // 1. Check FastAPI Backend Health on Mount
   useEffect(() => {
-    const ws = new WebSocket("ws://localhost:8000/ws/predict");
-    wsRef.current = ws;
-
-    ws.onopen = () => setWsStatus("Connected");
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        const pred = data.prediction;
-        setPrediction(pred || "-");
-
-        if (pred && pred.length === 1 && pred !== lastAddedCharRef.current && pred !== "-" && pred !== "...") {
-          setCurrentWord((prev) => prev + pred);
-          lastAddedCharRef.current = pred;
-        }
-      } catch (err) {
-        console.error("WebSocket message parsing error:", err);
-      }
-    };
-    ws.onerror = () => setWsStatus("Error");
-    ws.onclose = () => setWsStatus("Disconnected");
-
-    return () => ws.close();
+    fetch("http://localhost:8000/")
+      .then((res) => {
+        if (res.ok) setServerStatus("Connected");
+        else setServerStatus("Error");
+      })
+      .catch(() => setServerStatus("Offline"));
   }, []);
 
   // 2. Initialize MediaPipe HandLandmarker
@@ -65,9 +48,9 @@ export default function App() {
     setupHandLandmarker();
   }, []);
 
-  // 3. Start Webcam Stream
+  // 3. Start Webcam Stream (640x480 optimized)
   const startWebcam = () => {
-    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } })
+    navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
       .then((stream) => {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
@@ -87,16 +70,26 @@ export default function App() {
     }
   };
 
-  // 4. Detection Loop
-  let lastVideoTime = -1;
+  const handleBackspace = () => {
+    setCurrentWord((prev) => prev.slice(0, -1));
+    lastAddedCharRef.current = ""; // Reset character lock so the same letter can be typed again if needed
+  };
+
+  // 4. Throttled Detection Loop (30 FPS) with HTTP POST
+  let lastProcessedTime = 0;
+  const FPS_LIMIT = 30;
+  const FRAME_INTERVAL = 1000 / FPS_LIMIT;
+
   const predictWebcam = async () => {
     try {
       if (videoRef.current && handLandmarkerRef.current && videoRef.current.readyState >= 2) {
-        if (videoRef.current.currentTime !== lastVideoTime) {
-          lastVideoTime = videoRef.current.currentTime;
+        const now = performance.now();
+        const elapsed = now - lastProcessedTime;
+
+        if (elapsed >= FRAME_INTERVAL) {
+          lastProcessedTime = now - (elapsed % FRAME_INTERVAL);
           
-          const startTimeMs = performance.now();
-          const results = handLandmarkerRef.current.detectForVideo(videoRef.current, startTimeMs);
+          const results = handLandmarkerRef.current.detectForVideo(videoRef.current, now);
 
           const canvasElement = canvasRef.current;
           const videoElement = videoRef.current;
@@ -113,32 +106,54 @@ export default function App() {
               const drawingUtils = new DrawingUtils(canvasCtx);
 
               if (results.landmarks && results.landmarks.length > 0) {
-                // Hand is present, reset missing frame tracking
-                missingFramesCountRef.current = 0;
-
-                for (const landmarks of results.landmarks) {
-                  drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, {
-                    color: "#22c55e",
-                    lineWidth: 3
-                  });
-                  drawingUtils.drawLandmarks(landmarks, {
-                    color: "#ef4444",
-                    lineWidth: 1.5,
-                    radius: 4
-                  });
-                }
-
                 const landmarks = results.landmarks[0];
-                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                  wsRef.current.send(JSON.stringify({ landmarks }));
+                
+                if (landmarks && landmarks.length === 21) {
+                  for (const lm of results.landmarks) {
+                    drawingUtils.drawConnectors(lm, HandLandmarker.HAND_CONNECTIONS, {
+                      color: "#22c55e",
+                      lineWidth: 3
+                    });
+                    drawingUtils.drawLandmarks(lm, {
+                      color: "#ef4444",
+                      lineWidth: 1.5,
+                      radius: 4
+                    });
+                  }
+
+                  // Fire asynchronous HTTP POST if not already waiting on a response
+                  if (!isFetchingRef.current) {
+                    isFetchingRef.current = true;
+                    fetch("http://localhost:8000/predict", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ landmarks })
+                    })
+                      .then((res) => res.json())
+                      .then((data) => {
+                        const pred = data.prediction;
+                        if (!pred || pred === "-") {
+                          setPrediction("-");
+                          return;
+                        }
+
+                        setPrediction(pred);
+
+                        if (pred.length === 1 && pred !== lastAddedCharRef.current) {
+                          setCurrentWord((prev) => prev + pred);
+                          lastAddedCharRef.current = pred;
+                        }
+                      })
+                      .catch((err) => console.error("Fetch prediction error:", err))
+                      .finally(() => {
+                        isFetchingRef.current = false;
+                      });
+                  }
                 }
               } else {
-                // Hand is missing, count frames before resetting active letter state
-                missingFramesCountRef.current += 1;
-                if (missingFramesCountRef.current > 10) { // ~1/3rd of a second threshold
-                  lastAddedCharRef.current = "";
-                  setPrediction("-");
-                }
+                // Hand is gone
+                lastAddedCharRef.current = "";
+                setPrediction("-");
               }
               canvasCtx.restore();
             }
@@ -159,13 +174,13 @@ export default function App() {
         <div style={styles.headerLeft}>
           <div style={{
             ...styles.dot,
-            backgroundColor: wsStatus === "Connected" ? "#10b981" : "#f43f5e"
+            backgroundColor: serverStatus === "Connected" ? "#10b981" : "#f43f5e"
           }} />
-          <h1 style={styles.title}>ASL Real-Time Translator</h1>
+          <h1 style={styles.title} className='tracking-'>ASL Real-Time Translator</h1>
         </div>
         <div style={styles.headerRight}>
-          <span style={styles.badge}>WS: {wsStatus}</span>
-          <span style={styles.badge}>MediaPipe + FastAPI</span>
+          <span style={styles.badge}>API: {serverStatus}</span>
+          <span style={styles.badge}>REST + FastAPI</span>
         </div>
       </header>
 
@@ -222,10 +237,16 @@ export default function App() {
 
             <div style={styles.buttonGroup}>
               <button 
-                onClick={() => setCurrentWord((prev) => prev + " ")}
+                onClick={() => { setCurrentWord((prev) => prev + " "); lastAddedCharRef.current = ""; }}
                 style={styles.btnSecondary}
               >
                 Space
+              </button>
+              <button 
+                onClick={handleBackspace}
+                style={styles.btnSecondary}
+              >
+                ⌫ Back
               </button>
               <button 
                 onClick={() => { setCurrentWord(""); lastAddedCharRef.current = ""; }} 
@@ -283,6 +304,7 @@ const styles = {
   title: {
     fontSize: "14px",
     fontWeight: "700",
+    letterSpacing:"0px",
     margin: 0,
   },
   headerRight: {
@@ -401,7 +423,7 @@ const styles = {
     backgroundColor: "#0f172a",
     border: "1px solid #1e293b",
     borderRadius: "8px",
-    padding: "12px",
+    padding: "100px",
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
@@ -409,7 +431,7 @@ const styles = {
     flexShrink: 0,
   },
   sectionTitle: {
-    fontSize: "10px",
+    fontSize: "15px",
     fontWeight: "600",
     color: "#94a3b8",
     textTransform: "uppercase",
@@ -424,7 +446,7 @@ const styles = {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    fontSize: "28px",
+    fontSize: "50px",
     fontWeight: "900",
     color: "#34d399",
   },
@@ -476,7 +498,7 @@ const styles = {
   },
   buttonGroup: {
     display: "grid",
-    gridTemplateColumns: "1fr 1fr 1fr",
+    gridTemplateColumns: "1fr 1fr 1fr 1fr", // Expanded to 4 columns for Space, Back, Clear, Speak
     gap: "6px",
     marginTop: "10px",
     flexShrink: 0,
@@ -485,7 +507,7 @@ const styles = {
     backgroundColor: "#1e293b",
     color: "#cbd5e1",
     border: "1px solid #334155",
-    padding: "6px",
+    padding: "6px 4px",
     borderRadius: "6px",
     fontSize: "11px",
     fontWeight: "600",
@@ -495,7 +517,7 @@ const styles = {
     backgroundColor: "#059669",
     color: "#ffffff",
     border: "none",
-    padding: "6px",
+    padding: "6px 4px",
     borderRadius: "6px",
     fontSize: "11px",
     fontWeight: "600",

@@ -3,6 +3,9 @@ from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 import joblib
+import warnings
+
+warnings.filterwarnings("ignore",category=UserWarning,module="sklearn")
 
 DATA_DIR = Path("./second/landmarks") # Adjust if your unzipped folder name differs
 
